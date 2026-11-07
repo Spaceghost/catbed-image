@@ -1,5 +1,5 @@
-# Throwaway Alpine edge build environment for the catbed ISO. Everything the
-# ISO *contains* comes from the locked closure in the Fossil snapshot; this
+# Throwaway Alpine edge build environment for the catbed images. Everything an
+# image *contains* comes from the locked closure in the Fossil snapshot; this
 # image only supplies the tools that assemble it.
 FROM docker.io/library/alpine:edge
 
@@ -11,5 +11,9 @@ RUN apk add --no-cache \
         https://gitlab.alpinelinux.org/alpine/aports.git /aports \
  && git -C /aports sparse-checkout set scripts \
  && git -C /aports rev-parse HEAD > /aports/REVISION
+
+# rootfs tarball and qcow2 (build-rootfs.sh). A separate layer, so adding to
+# it does not re-clone aports under the ISO build.
+RUN apk add --no-cache e2fsprogs e2fsprogs-extra qemu-img sfdisk tar umount zstd
 
 WORKDIR /work

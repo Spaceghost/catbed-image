@@ -169,6 +169,34 @@ render: {
 			"""
 	}
 
+	// The qcow2 is a VM rendition of the same system: one GPT disk with the
+	// ESP and a plain ext4 root (no LUKS, no LVM: there is no passphrase to
+	// type into a test VM and no secret to protect in it), consoles on tty1
+	// and ttyS0 that log the user straight in, and the boot line for virtio.
+	// Everything else is the machine's own file.
+	vmFiles: {
+		for k, v in files if k != "etc/fstab" {(k): v}
+		"etc/fstab": """
+			UUID=@ROOT_UUID@	/	ext4	rw,relatime	0 1
+			UUID=@ESP_UUID@	/boot	vfat	rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=utf8,shortname=mixed,errors=remount-ro	0 2
+			tmpfs	/tmp	tmpfs	nosuid,nodev	0	0
+
+			"""
+		"etc/inittab": """
+			::sysinit:/sbin/openrc sysinit
+			::sysinit:/sbin/openrc boot
+			::wait:/sbin/openrc default
+			tty1::respawn:/sbin/agetty --autologin \(machine.user.name) --noclear tty1 linux
+			ttyS0::respawn:/sbin/agetty --autologin \(machine.user.name) -L 115200 ttyS0 vt100
+			tty2::respawn:/sbin/getty 38400 tty2
+			::ctrlaltdel:/sbin/reboot
+			::shutdown:/sbin/openrc shutdown
+
+			"""
+	}
+	vmCmdline: "root=UUID=@ROOT_UUID@ rootfstype=ext4 modules=sd-mod,usb-storage,ext4,virtio_pci,virtio_blk console=tty0 console=ttyS0,115200 quiet"
+	vmFreeGiB: 8
+
 	isoExtras: machine.iso.extras
 	isoLabel:  machine.iso.label
 	lock:      machine.packages.lock

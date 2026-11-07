@@ -1,60 +1,13 @@
 #!/bin/sh
-# Runs inside the builder container. Mounts (all set up by bin/build-image):
-#   /src     this repository, read-only
-#   /inputs  files.fossil snapshot, read-only
-#   /keys    persistent image signing key (private, never in the repo)
-#   /cache   exported closure, repo, mkimage work dirs
-#   /out     ISO and manifest
+# Build the catbed installer ISO. Runs inside the builder container; see
+# prepare.sh for the mounts and the shared stages.
 set -eu
+# shellcheck source=prepare.sh
+. /src/builder/prepare.sh
 
-say() { printf '== %s\n' "$*"; }
-die() { printf 'build-iso: %s\n' "$*" >&2; exit 1; }
-
-DB=/inputs/files.fossil
-[ -r "$DB" ] || die "no Fossil snapshot at $DB"
-
-say 'Rendering catbed.cue'
-render=/cache/render
-rm -rf "$render"; mkdir -p "$render"
-(cd /src && cue vet ./... && cue export . -e render --out json) > "$render/render.json"
-python3 - "$render" <<'PY'
-import json, sys
-from pathlib import Path
-root = Path(sys.argv[1]); r = json.loads((root / 'render.json').read_text())
-(root / 'machine.env').write_text(r['env'])
-for rel, text in r['files'].items():
-    dest = root / 'target' / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text)
-for key in ('isoExtras', 'isoLabel', 'lock'):
-    val = r[key]
-    (root / key).write_text((' '.join(val) if isinstance(val, list) else val) + '\n')
-PY
-LOCK=$(cat "$render/lock")
-BRANCH=$(sed -n "s/^FOSSIL_BRANCH='\(.*\)'$/\1/p" "$render/machine.env")
-EXTRAS=$(cat "$render/isoExtras")
-
-say "Exporting the locked closure ($LOCK @ $BRANCH)"
-closure=/cache/closure
-python3 /src/builder/export-packages.py "$DB" "$BRANCH" "$LOCK" "$closure"
-
-say 'Image signing key'
-key=
-for k in /keys/*.rsa; do [ -e "$k" ] && key=$k; done
-if [ -z "$key" ]; then
-    (cd /keys && openssl genrsa -out catbed-image.rsa 4096 2>/dev/null &&
-        openssl rsa -in catbed-image.rsa -pubout -out catbed-image.rsa.pub 2>/dev/null)
-    key=/keys/catbed-image.rsa
-fi
-mkdir -p /root/.abuild
-printf 'PACKAGER_PRIVKEY="%s"\n' "$key" > /root/.abuild/abuild.conf
-# mkimage copies /etc/apk/keys into the ISO's initramfs and apk root.
-cp "$closure"/keys/* /etc/apk/keys/
-cp "$key.pub" /etc/apk/keys/
-
-say "Assembling the local repository (+ ISO-only: $EXTRAS)"
+say "ISO repository (closure + ISO-only: $EXTRAS)"
 repo=/cache/repo/catbed
-rm -rf "$repo"; mkdir -p "$repo/x86_64" /cache/extras
+rm -rf "$repo" /cache/extras; mkdir -p "$repo/x86_64" /cache/extras
 cp "$closure"/packages/*.apk "$repo/x86_64/"
 # ISO-only packages and any dependency the lock lacks; locked names win.
 # shellcheck disable=SC2086 # EXTRAS is a word list
@@ -92,28 +45,8 @@ for f in /cache/stub/out/*/*/linux-firmware-0-r0.apk; do
     cp "$f" "$repo/x86_64/"
     printf '%s %s (generated stub)\n' "$(sha256sum "$f" | cut -c1-64)" "${f##*/}" >> /cache/extras.list
 done
-(cd "$repo/x86_64" && apk index --quiet --rewrite-arch x86_64 \
-    --description "catbed $(date -u +%Y%m%d)" -o APKINDEX.tar.gz ./*.apk &&
-    abuild-sign -q APKINDEX.tar.gz)
-
-say 'Payload: Fossil database + manifest'
-payload=/cache/payload
-rm -rf "$payload"; mkdir -p "$payload"
-cp "$DB" "$payload/files.fossil"
-(cd "$payload" && sha256sum files.fossil > files.fossil.sha256)
-checkin=$(fossil info "$BRANCH" -R "$DB" | sed -n 's/^hash: *\([0-9a-f]*\).*/\1/p')
-python3 - "$payload/manifest.json" "$LOCK" "$checkin" "$(cat /aports/REVISION)" <<'PY'
-import json, sys, time
-from pathlib import Path
-out, lock, checkin, aports = sys.argv[1:]
-extras = [dict(zip(('sha256', 'file'), l.split(' ', 1)))
-          for l in Path('/cache/extras.list').read_text().splitlines() if l]
-Path(out).write_text(json.dumps({
-    'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'fossil_checkin': checkin, 'lock': lock, 'aports_revision': aports,
-    'files_fossil_sha256': Path(out).with_name('files.fossil.sha256').read_text().split()[0],
-    'iso_only_packages': extras}, indent=1) + '\n')
-PY
+index_repo "$repo"
+write_manifest "$payload/manifest.json" iso /cache/extras.list
 
 say 'Live overlay (/etc/catbed)'
 overlay=/cache/overlay
