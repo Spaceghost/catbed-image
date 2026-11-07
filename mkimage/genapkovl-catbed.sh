@@ -41,8 +41,10 @@ findmnt
 lsblk
 lvm2
 sfdisk
+tar
 umount
 util-linux-misc
+zstd
 EOF
 
 makefile root:root 0644 "$tmp"/etc/motd <<EOF

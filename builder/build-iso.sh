@@ -122,7 +122,8 @@ cp "$render/machine.env" "$overlay/"
 cp -a "$render/target" "$overlay/target"
 cp "$closure/world" "$closure/repositories" "$overlay/"
 cp "$closure"/keys/* "$key.pub" "$overlay/keys/"
-cp /src/installer/catbed-install /src/installer/catbed-firstboot "$overlay/"
+cp /src/installer/catbed-install /src/installer/catbed-firstboot \
+    /src/installer/catbed-common.sh "$overlay/"
 
 say 'mkimage'
 cp /src/mkimage/mkimg.catbed.sh /src/mkimage/genapkovl-catbed.sh /aports/scripts/

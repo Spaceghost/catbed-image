@@ -2,13 +2,14 @@
 # catbed-install: lay the catbed base system onto one disk, offline, from this
 # installer's own media. ERASES THE DISK. Run as root on the live ISO.
 #
-#   catbed-install [--disk /dev/sdX] [--plan]
+#   catbed-install [--disk /dev/sdX] [--rootfs FILE.tar.zst] [--plan]
 #
 # What it does, in order: GPT with an EFI partition and a LUKS2 partition;
-# LVM inside LUKS (swap + root); the locked package closure from the media's
-# repository; base config rendered from catbed.cue; user, services, initramfs
-# and GRUB; then the Fossil database and the ~/.files checkout, so the first
-# login can run `catbed-firstboot`, which hands over to oldbook-rebuild.
+# LVM inside LUKS (swap + root); then either the locked package closure from
+# the media's repository, or (--rootfs) a prebuilt catbed rootfs tarball;
+# base config rendered from catbed.cue; user, services, initramfs and GRUB;
+# the Fossil database and the ~/.files checkout, so the first login can run
+# `catbed-firstboot`, which hands over to oldbook-rebuild.
 #
 # Secrets are typed at the console only: the LUKS passphrase (cryptsetup asks)
 # and account passwords (passwd asks). Nothing secret is on the media.
@@ -18,21 +19,17 @@ CONF=/etc/catbed
 TARGET=/mnt
 PLAN=0
 DISK=
+ROOTFS=
 
-say() { printf '%s\n' "$*"; }
-step() { printf '\n== %s\n' "$*"; }
-die() { printf 'catbed-install: %s\n' "$*" >&2; exit 1; }
-run() {
-    if [ "$PLAN" = 1 ]; then say "  would run: $*"; return 0; fi
-    "$@"
-}
-in_target() { run chroot "$TARGET" "$@"; }
+# shellcheck source=catbed-common.sh
+. "$CONF/catbed-common.sh"
 
 while [ $# -gt 0 ]; do
     case $1 in
         --disk) DISK=${2:?--disk needs a device}; shift 2 ;;
+        --rootfs) ROOTFS=${2:?--rootfs needs a file}; shift 2 ;;
         --plan) PLAN=1; shift ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -41,6 +38,7 @@ done
 # shellcheck source=/dev/null
 . "$CONF/machine.env"
 [ "$PLAN" = 1 ] || [ "$(id -u)" = 0 ] || die 'run as root'
+[ -z "$ROOTFS" ] || [ -r "$ROOTFS" ] || die "cannot read $ROOTFS"
 
 MEDIA=
 for m in /media/cdrom /media/usb /media/*; do
@@ -124,51 +122,35 @@ else
     CRYPT_UUID=$(blkid -s UUID -o value "$LUKSDEV")
 fi
 
-step 'Base configuration from catbed.cue'
-if [ "$PLAN" = 1 ]; then
-    (cd "$CONF/target" && find . -type f) | sed 's|^\.|  would write: '"$TARGET"'|'
-else
-    (cd "$CONF/target" && find . -type f) | while read -r rel; do
-        dest=$TARGET/${rel#./}
-        mkdir -p "$(dirname "$dest")"
-        sed -e "s|@ESP_UUID@|$ESP_UUID|g" -e "s|@CRYPT_UUID@|$CRYPT_UUID|g" \
-            "$CONF/target/$rel" > "$dest"
-    done
-    chmod 600 "$TARGET/etc/wpa_supplicant/wpa_supplicant.conf"
-    chmod 600 "$TARGET/etc/doas.d/catbed-base.conf"
-    mkdir -p "$TARGET/etc/apk/keys"
-    cp "$CONF/keys/"* "$TARGET/etc/apk/keys/"
-    # Every tag the lock's world uses resolves to the media while installing.
-    printf '%s\n@testing %s\n@1password %s\n@personal %s\n' \
-        "$REPO" "$REPO" "$REPO" "$REPO" > "$TARGET/etc/apk/repositories"
-    ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
-    printf '%s\n' "$TIMEZONE" > "$TARGET/etc/timezone"
-fi
-
 step 'Binding /dev, /proc and /sys for package scripts'
 run mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
 run mount -t proc proc "$TARGET/proc"
 run mount -o rbind /dev "$TARGET/dev"
 run mount -o rbind /sys "$TARGET/sys"
 
-step "Installing the locked closure ($(wc -l < "$CONF/world") world entries) from $REPO"
-# shellcheck disable=SC2046
-run apk add --root "$TARGET" --initdb --arch x86_64 --no-cache \
-    --keys-dir "$TARGET/etc/apk/keys" \
-    --repositories-file "$TARGET/etc/apk/repositories" \
-    $(cat "$CONF/world")
-if [ "$PLAN" = 0 ]; then
-    cp "$CONF/world" "$TARGET/etc/apk/world"
-    # From here the machine uses the lock's own repositories; the media line
-    # stays, commented, for an offline repair.
-    { printf '#%s\n' "$REPO"; grep -v '^#' "$CONF/repositories"; } > "$TARGET/etc/apk/repositories"
+if [ -n "$ROOTFS" ]; then
+    step "Extracting $ROOTFS"
+    # The tarball carries the machine files with @...@ tokens unresolved.
+    # /boot is the vfat ESP: it takes no Unix owners, so it is unpacked apart.
+    run sh -c 'zstd -dc "$1" | tar -xp --xattrs --numeric-owner --exclude=./boot/* -C "$2" -f -' \
+        sh "$ROOTFS" "$TARGET"
+    run sh -c 'zstd -dc "$1" | tar -x --no-same-owner --no-same-permissions -C "$2" -f - ./boot' \
+        sh "$ROOTFS" "$TARGET"
+    for rel in etc/fstab etc/default/grub; do
+        run sed -i -e "s|@ESP_UUID@|$ESP_UUID|g" -e "s|@CRYPT_UUID@|$CRYPT_UUID|g" "$TARGET/$rel"
+    done
+else
+    step 'Base configuration from catbed.cue'
+    lay_config "$CONF/target" "$ESP_UUID" "$CRYPT_UUID" '@ROOT_UUID@'
+    step "Installing the locked closure ($(wc -l < "$CONF/world") world entries) from $REPO"
+    install_closure
+    step "User $USER_NAME (uid $USER_UID)"
+    create_user
+    step 'OpenRC services'
+    enable_services
 fi
 
-step "User $USER_NAME (uid $USER_UID)"
-in_target adduser -D -u "$USER_UID" -s "$USER_SHELL" "$USER_NAME"
-for group in $USER_GROUPS; do
-    in_target addgroup "$USER_NAME" "$group"
-done
+step "Passwords"
 say "Password for $USER_NAME:"
 in_target passwd "$USER_NAME"
 if [ "$PLAN" = 0 ]; then
@@ -180,61 +162,17 @@ if [ "$PLAN" = 0 ]; then
     esac
 fi
 
-step 'OpenRC services'
-for level in sysinit boot default shutdown; do
-    case $level in
-        sysinit) list=$SVC_SYSINIT ;; boot) list=$SVC_BOOT ;;
-        default) list=$SVC_DEFAULT ;; shutdown) list=$SVC_SHUTDOWN ;;
-    esac
-    for svc in $list; do
-        case " $FROM_CHECKOUT " in
-            *" $svc "*) say "  left for oldbook-rebuild: $svc ($level)"; continue ;;
-        esac
-        if [ "$PLAN" = 1 ] || [ -e "$TARGET/etc/init.d/$svc" ]; then
-            in_target rc-update add "$svc" "$level" >/dev/null
-        else
-            say "  no init script after install, skipped: $svc ($level)"
-        fi
-    done
-done
-
 step 'Initramfs (cryptsetup + lvm) and GRUB'
-if [ "$PLAN" = 1 ]; then
-    in_target mkinitfs '<kernel-version>'
-else
-    kver=
-    for dir in "$TARGET"/lib/modules/*; do kver=${dir##*/}; done
-    [ -n "$kver" ] || die 'no kernel modules in the target'
-    in_target mkinitfs "$kver"
-fi
+build_initramfs
 # --removable writes EFI/BOOT/BOOTX64.EFI, which Mac firmware boots without
 # an NVRAM entry; --no-nvram keeps efibootmgr (absent from the lock) out of it.
 in_target grub-install --target=x86_64-efi --efi-directory=/boot --removable --no-nvram
 in_target grub-mkconfig -o /boot/grub/grub.cfg
 
-step "Fossil database and ~/.files checkout ($FOSSIL_BRANCH)"
-home=/home/$USER_NAME
-if [ -f "$PAYLOAD/files.fossil" ]; then
-    run install -d -m 700 -o "$USER_UID" -g "$USER_UID" \
-        "$TARGET$home/.local" "$TARGET$home/.local/share" "$TARGET$home/.local/share/fossil"
-    run install -m 600 -o "$USER_UID" -g "$USER_UID" \
-        "$PAYLOAD/files.fossil" "$TARGET$home/.local/share/fossil/files.fossil"
-    in_target su -s /bin/sh "$USER_NAME" -c \
-        "mkdir -p ~/.files && cd ~/.files && fossil open --quiet ~/.local/share/fossil/files.fossil $FOSSIL_BRANCH >/dev/null"
-else
-    say '  no files.fossil on the media; follow RECOVERY.md steps 2-4 after first boot'
-fi
-run install -m 755 "$CONF/catbed-firstboot" "$TARGET/usr/local/bin/catbed-firstboot"
-if [ "$PLAN" = 0 ]; then
-    mkdir -p "$TARGET/var/lib/catbed"
-    cp "$PAYLOAD/manifest.json" "$TARGET/var/lib/catbed/iso-manifest.json" 2>/dev/null || true
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$TARGET/var/lib/catbed/installed-at"
-    cat >> "$TARGET/etc/motd" <<EOF
-
-  catbed base system installed. Log in as $USER_NAME and run:
-      catbed-firstboot
-  It hands over to ~/.files/alpine/bin/oldbook-rebuild.
-EOF
+if [ -z "$ROOTFS" ]; then
+    step "Fossil database and ~/.files checkout ($FOSSIL_BRANCH)"
+    place_checkout "$PAYLOAD"
+    stamp_handoff "$PAYLOAD/manifest.json"
 fi
 
 step 'Unmounting'
