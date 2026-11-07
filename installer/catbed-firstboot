@@ -1,0 +1,28 @@
+#!/bin/sh
+# catbed-firstboot: the handoff from a fresh catbed-install to the desktop.
+# Run as the desktop user on the installed machine. Previews oldbook-rebuild,
+# asks, then runs it. Safe to run again; the rebuild is idempotent.
+set -eu
+
+FILES=$HOME/.files
+say() { printf '%s\n' "$*"; }
+die() { printf 'catbed-firstboot: %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" != 0 ] || die "run as your user, not root (the rebuild uses doas itself)"
+[ -x "$FILES/alpine/bin/oldbook-rebuild" ] ||
+    die "no checkout at $FILES; restore it with RECOVERY.md steps 2-4 first"
+
+cd "$FILES"
+say "Checkout: $(fossil info | sed -n 's/^checkout: *//p')"
+say ''
+say 'Packages come from the Fossil database, so no network is needed for them.'
+say 'Wi-Fi, Tailscale and the ChatGPT login need a network and a person; the'
+say 'rebuild reports those at the end rather than attempting them.'
+say ''
+alpine/bin/oldbook-rebuild --plan
+printf '\nRun the rebuild now? [y/N] '
+read -r reply
+case $reply in
+    y|Y) exec alpine/bin/oldbook-rebuild ;;
+    *) say 'Not run. Start it later with: catbed-firstboot' ;;
+esac

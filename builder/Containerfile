@@ -1,0 +1,15 @@
+# Throwaway Alpine edge build environment for the catbed ISO. Everything the
+# ISO *contains* comes from the locked closure in the Fossil snapshot; this
+# image only supplies the tools that assemble it.
+FROM docker.io/library/alpine:edge
+
+RUN apk add --no-cache \
+        abuild alpine-conf apk-tools busybox cue-cli dosfstools fossil \
+        git grub grub-efi mtools openssl python3 shellcheck squashfs-tools \
+        syslinux xorriso \
+ && git clone --depth 1 --filter=blob:none --sparse \
+        https://gitlab.alpinelinux.org/alpine/aports.git /aports \
+ && git -C /aports sparse-checkout set scripts \
+ && git -C /aports rev-parse HEAD > /aports/REVISION
+
+WORKDIR /work

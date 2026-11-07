@@ -1,0 +1,70 @@
+#!/bin/sh
+# build-image: build the catbed installer ISO on this host (fedora) in a
+# rootless podman container. Private inputs and outputs live outside the
+# repository, under $CATBED_PRIVATE (default ~/.local/share/catbed-image):
+#
+#   inputs/files.fossil   Fossil snapshot of ~/.files (copied from catbed)
+#   keys/                 image signing key, generated on first build
+#   cache/                exported closure, repo, mkimage work
+#   out/                  ISO, .sha256 and manifest
+#
+# usage: build-image check | iso | plan | shell
+set -eu
+
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+PRIVATE=${CATBED_PRIVATE:-$HOME/.local/share/catbed-image}
+IMAGE=localhost/catbed-builder:latest
+
+die() { printf 'build-image: %s\n' "$*" >&2; exit 1; }
+
+builder() {
+    podman build --quiet -t "$IMAGE" -f "$REPO/builder/Containerfile" "$REPO/builder" >/dev/null
+}
+
+container() {
+    mkdir -p "$PRIVATE/inputs" "$PRIVATE/keys" "$PRIVATE/cache" "$PRIVATE/out"
+    chmod 700 "$PRIVATE" "$PRIVATE/keys"
+    podman run --rm "$@"
+}
+
+mounts() {
+    printf '%s\n' \
+        -v "$REPO:/src:ro,z" \
+        -v "$PRIVATE/inputs:/inputs:ro,z" \
+        -v "$PRIVATE/keys:/keys:z" \
+        -v "$PRIVATE/cache:/cache:z" \
+        -v "$PRIVATE/out:/out:z"
+}
+
+case ${1:-} in
+    check)
+        builder
+        container -v "$REPO:/src:ro,z" "$IMAGE" sh -c '
+            cd /src && cue vet ./... && cue export . -e render.env --out text >/dev/null &&
+            shellcheck -s sh installer/catbed-install installer/catbed-firstboot \
+                builder/build-iso.sh bin/build-image mkimage/genapkovl-catbed.sh &&
+            shellcheck -s sh -e SC2034,SC2154,SC2046,SC3043,SC2086,SC2155,SC2153,SC2016 mkimage/mkimg.catbed.sh &&
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" builder/export-packages.py && echo check: ok'
+        ;;
+    plan)
+        builder
+        container -v "$REPO:/src:ro,z" "$IMAGE" sh -c '
+            cd /src && cue export . -e render.env --out text'
+        ;;
+    iso)
+        [ -r "$PRIVATE/inputs/files.fossil" ] ||
+            die "no snapshot at $PRIVATE/inputs/files.fossil (see README: Inputs)"
+        builder
+        # shellcheck disable=SC2046
+        container $(mounts) "$IMAGE" sh /src/builder/build-iso.sh
+        ;;
+    shell)
+        builder
+        # shellcheck disable=SC2046
+        container -it $(mounts) "$IMAGE" sh
+        ;;
+    *)
+        sed -n '2,13p' "$0"
+        exit 2
+        ;;
+esac

@@ -1,0 +1,8 @@
+# Private material never enters this public repository.
+*.iso
+*.fossil
+*.rsa
+*.apk
+out/
+cache/
+private/

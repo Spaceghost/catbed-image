@@ -1,0 +1,250 @@
+#!/bin/sh
+# catbed-install: lay the catbed base system onto one disk, offline, from this
+# installer's own media. ERASES THE DISK. Run as root on the live ISO.
+#
+#   catbed-install [--disk /dev/sdX] [--plan]
+#
+# What it does, in order: GPT with an EFI partition and a LUKS2 partition;
+# LVM inside LUKS (swap + root); the locked package closure from the media's
+# repository; base config rendered from catbed.cue; user, services, initramfs
+# and GRUB; then the Fossil database and the ~/.files checkout, so the first
+# login can run `catbed-firstboot`, which hands over to oldbook-rebuild.
+#
+# Secrets are typed at the console only: the LUKS passphrase (cryptsetup asks)
+# and account passwords (passwd asks). Nothing secret is on the media.
+set -eu
+
+CONF=/etc/catbed
+TARGET=/mnt
+PLAN=0
+DISK=
+
+say() { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+die() { printf 'catbed-install: %s\n' "$*" >&2; exit 1; }
+run() {
+    if [ "$PLAN" = 1 ]; then say "  would run: $*"; return 0; fi
+    "$@"
+}
+in_target() { run chroot "$TARGET" "$@"; }
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --disk) DISK=${2:?--disk needs a device}; shift 2 ;;
+        --plan) PLAN=1; shift ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+[ -r "$CONF/machine.env" ] || die "$CONF/machine.env missing; is this the catbed ISO?"
+# shellcheck source=/dev/null
+. "$CONF/machine.env"
+[ "$PLAN" = 1 ] || [ "$(id -u)" = 0 ] || die 'run as root'
+
+MEDIA=
+for m in /media/cdrom /media/usb /media/*; do
+    if [ -d "$m/apks" ] && [ -d "$m/catbed" ]; then MEDIA=$m; break; fi
+done
+[ -n "$MEDIA" ] || die 'no mounted catbed media (expected <media>/apks and <media>/catbed)'
+REPO=$MEDIA/apks
+PAYLOAD=$MEDIA/catbed
+
+DISK=${DISK:-$DISK_DEFAULT}
+[ -b "$DISK" ] || [ "$PLAN" = 1 ] || die "$DISK is not a block device"
+case $DISK in
+    *nvme*|*mmcblk*|*loop*) PART=${DISK}p ;;
+    *) PART=$DISK ;;
+esac
+ESP=${PART}1
+LUKSDEV=${PART}2
+MAPPED=/dev/mapper/$LUKS_MAPPER
+
+for tool in sfdisk cryptsetup pvcreate vgcreate lvcreate mkfs.vfat mkfs.ext4 mkswap blkid apk; do
+    command -v "$tool" >/dev/null 2>&1 || [ "$PLAN" = 1 ] || die "missing tool: $tool"
+done
+
+media_disk=$(findmnt -no SOURCE "$MEDIA" 2>/dev/null || true)
+case $media_disk in
+    "$DISK"*) die "$DISK holds the installer media itself ($media_disk)" ;;
+esac
+if [ "$PLAN" = 0 ] && grep -q "^$PART" /proc/mounts; then
+    die "a partition of $DISK is mounted; unmount it first"
+fi
+
+step "Target: $MODEL as $MACHINE_HOSTNAME on $DISK"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MODEL "$DISK" 2>/dev/null || true
+if [ "$PLAN" = 0 ]; then
+    printf '\nEverything on %s will be destroyed.\nType the device name (%s) to continue: ' \
+        "$DISK" "${DISK#/dev/}"
+    read -r reply
+    [ "$reply" = "${DISK#/dev/}" ] || die 'not confirmed; nothing changed'
+fi
+
+trap 'echo; echo "catbed-install stopped. Mounts are left under $TARGET for inspection." >&2' EXIT
+
+step 'Partitioning (GPT: EFI System + Linux LVM)'
+# shellcheck disable=SC2016
+run sh -c 'printf "label: gpt\n,%sMiB,U\n,,V\n" "$1" | sfdisk --wipe always --wipe-partitions always "$2"' \
+    sh "$EFI_MIB" "$DISK"
+if [ "$PLAN" = 0 ]; then
+    mdev -s 2>/dev/null || true
+    i=0
+    while [ ! -b "$LUKSDEV" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+    [ -b "$LUKSDEV" ] || die "$LUKSDEV did not appear"
+fi
+run mkfs.vfat -F 32 "$ESP"
+
+step "LUKS2 on $LUKSDEV (you will be asked for the passphrase)"
+run cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 \
+    --cipher "$LUKS_CIPHER" --key-size "$LUKS_KEYBITS" --hash "$LUKS_HASH" \
+    --pbkdf "$LUKS_PBKDF" --pbkdf-force-iterations "$LUKS_TIME" \
+    --pbkdf-memory "$LUKS_MEMORY" --pbkdf-parallel "$LUKS_THREADS" "$LUKSDEV"
+say 'Unlock it once more to continue the install:'
+run cryptsetup open "$LUKSDEV" "$LUKS_MAPPER"
+
+step "LVM: $VG with lv_swap (${SWAP_GIB}G) and lv_root (rest)"
+run pvcreate -ff -y "$MAPPED"
+run vgcreate "$VG" "$MAPPED"
+run lvcreate -y -L "${SWAP_GIB}G" -n lv_swap "$VG"
+run lvcreate -y -l 100%FREE -n lv_root "$VG"
+run mkfs.ext4 -q "/dev/$VG/lv_root"
+run mkswap "/dev/$VG/lv_swap"
+
+step "Mounting at $TARGET"
+run mount "/dev/$VG/lv_root" "$TARGET"
+run mkdir -p "$TARGET/boot"
+run mount -t vfat "$ESP" "$TARGET/boot"
+
+if [ "$PLAN" = 1 ]; then
+    ESP_UUID='<esp-uuid>'
+    CRYPT_UUID='<luks-uuid>'
+else
+    ESP_UUID=$(blkid -s UUID -o value "$ESP")
+    CRYPT_UUID=$(blkid -s UUID -o value "$LUKSDEV")
+fi
+
+step 'Base configuration from catbed.cue'
+if [ "$PLAN" = 1 ]; then
+    (cd "$CONF/target" && find . -type f) | sed 's|^\.|  would write: '"$TARGET"'|'
+else
+    (cd "$CONF/target" && find . -type f) | while read -r rel; do
+        dest=$TARGET/${rel#./}
+        mkdir -p "$(dirname "$dest")"
+        sed -e "s|@ESP_UUID@|$ESP_UUID|g" -e "s|@CRYPT_UUID@|$CRYPT_UUID|g" \
+            "$CONF/target/$rel" > "$dest"
+    done
+    chmod 600 "$TARGET/etc/wpa_supplicant/wpa_supplicant.conf"
+    chmod 600 "$TARGET/etc/doas.d/catbed-base.conf"
+    mkdir -p "$TARGET/etc/apk/keys"
+    cp "$CONF/keys/"* "$TARGET/etc/apk/keys/"
+    # Every tag the lock's world uses resolves to the media while installing.
+    printf '%s\n@testing %s\n@1password %s\n@personal %s\n' \
+        "$REPO" "$REPO" "$REPO" "$REPO" > "$TARGET/etc/apk/repositories"
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
+    printf '%s\n' "$TIMEZONE" > "$TARGET/etc/timezone"
+fi
+
+step 'Binding /dev, /proc and /sys for package scripts'
+run mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
+run mount -t proc proc "$TARGET/proc"
+run mount -o rbind /dev "$TARGET/dev"
+run mount -o rbind /sys "$TARGET/sys"
+
+step "Installing the locked closure ($(wc -l < "$CONF/world") world entries) from $REPO"
+# shellcheck disable=SC2046
+run apk add --root "$TARGET" --initdb --arch x86_64 --no-cache \
+    --keys-dir "$TARGET/etc/apk/keys" \
+    --repositories-file "$TARGET/etc/apk/repositories" \
+    $(cat "$CONF/world")
+if [ "$PLAN" = 0 ]; then
+    cp "$CONF/world" "$TARGET/etc/apk/world"
+    # From here the machine uses the lock's own repositories; the media line
+    # stays, commented, for an offline repair.
+    { printf '#%s\n' "$REPO"; grep -v '^#' "$CONF/repositories"; } > "$TARGET/etc/apk/repositories"
+fi
+
+step "User $USER_NAME (uid $USER_UID)"
+in_target adduser -D -u "$USER_UID" -s "$USER_SHELL" "$USER_NAME"
+for group in $USER_GROUPS; do
+    in_target addgroup "$USER_NAME" "$group"
+done
+say "Password for $USER_NAME:"
+in_target passwd "$USER_NAME"
+if [ "$PLAN" = 0 ]; then
+    printf 'Set a root password too? Without one root is locked and doas is the way in. [y/N] '
+    read -r reply
+    case $reply in
+        y|Y) chroot "$TARGET" passwd root ;;
+        *) chroot "$TARGET" passwd -l root ;;
+    esac
+fi
+
+step 'OpenRC services'
+for level in sysinit boot default shutdown; do
+    case $level in
+        sysinit) list=$SVC_SYSINIT ;; boot) list=$SVC_BOOT ;;
+        default) list=$SVC_DEFAULT ;; shutdown) list=$SVC_SHUTDOWN ;;
+    esac
+    for svc in $list; do
+        case " $FROM_CHECKOUT " in
+            *" $svc "*) say "  left for oldbook-rebuild: $svc ($level)"; continue ;;
+        esac
+        if [ "$PLAN" = 1 ] || [ -e "$TARGET/etc/init.d/$svc" ]; then
+            in_target rc-update add "$svc" "$level" >/dev/null
+        else
+            say "  no init script after install, skipped: $svc ($level)"
+        fi
+    done
+done
+
+step 'Initramfs (cryptsetup + lvm) and GRUB'
+if [ "$PLAN" = 1 ]; then
+    in_target mkinitfs '<kernel-version>'
+else
+    kver=
+    for dir in "$TARGET"/lib/modules/*; do kver=${dir##*/}; done
+    [ -n "$kver" ] || die 'no kernel modules in the target'
+    in_target mkinitfs "$kver"
+fi
+# --removable writes EFI/BOOT/BOOTX64.EFI, which Mac firmware boots without
+# an NVRAM entry; --no-nvram keeps efibootmgr (absent from the lock) out of it.
+in_target grub-install --target=x86_64-efi --efi-directory=/boot --removable --no-nvram
+in_target grub-mkconfig -o /boot/grub/grub.cfg
+
+step "Fossil database and ~/.files checkout ($FOSSIL_BRANCH)"
+home=/home/$USER_NAME
+if [ -f "$PAYLOAD/files.fossil" ]; then
+    run install -d -m 700 -o "$USER_UID" -g "$USER_UID" \
+        "$TARGET$home/.local" "$TARGET$home/.local/share" "$TARGET$home/.local/share/fossil"
+    run install -m 600 -o "$USER_UID" -g "$USER_UID" \
+        "$PAYLOAD/files.fossil" "$TARGET$home/.local/share/fossil/files.fossil"
+    in_target su -s /bin/sh "$USER_NAME" -c \
+        "mkdir -p ~/.files && cd ~/.files && fossil open --quiet ~/.local/share/fossil/files.fossil $FOSSIL_BRANCH >/dev/null"
+else
+    say '  no files.fossil on the media; follow RECOVERY.md steps 2-4 after first boot'
+fi
+run install -m 755 "$CONF/catbed-firstboot" "$TARGET/usr/local/bin/catbed-firstboot"
+if [ "$PLAN" = 0 ]; then
+    mkdir -p "$TARGET/var/lib/catbed"
+    cp "$PAYLOAD/manifest.json" "$TARGET/var/lib/catbed/iso-manifest.json" 2>/dev/null || true
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$TARGET/var/lib/catbed/installed-at"
+    cat >> "$TARGET/etc/motd" <<EOF
+
+  catbed base system installed. Log in as $USER_NAME and run:
+      catbed-firstboot
+  It hands over to ~/.files/alpine/bin/oldbook-rebuild.
+EOF
+fi
+
+step 'Unmounting'
+run umount -R "$TARGET/sys" || true
+run umount -R "$TARGET/dev" || true
+run umount "$TARGET/proc"
+run umount "$TARGET/boot"
+run umount "$TARGET"
+run vgchange -an "$VG"
+run cryptsetup close "$LUKS_MAPPER"
+trap - EXIT
+say ''
+say 'Done. Remove the installer media and reboot.'
