@@ -134,10 +134,12 @@ sed -i 's/ add --initdb --no-chown/ add --initdb/' /aports/scripts/mkimage.sh
 chmod +x /aports/scripts/genapkovl-catbed.sh
 export CATBED_NAMES="$closure/names" CATBED_EXTRAS="$EXTRAS" \
     CATBED_PAYLOAD="$payload" CATBED_OVERLAY="$overlay"
+# Always from an empty work dir. mkimage reuses any section whose directory
+# exists, and the names do not cover the inputs: the overlay is just
+# apkovl_<hostname>, the package and kernel sections hash the package names,
+# not the packages. A kept work dir silently ships the previous overlay.
+rm -rf /cache/mkimage
 mkdir -p /cache/mkimage
-# mkimage only initialises its apk root when the directory is absent, so a
-# failed run would poison every later one; the package cache inside is cheap.
-rm -rf /cache/mkimage/apkroot-x86_64
 # --hostkeys: the lock's 1Password and personal keys, not only Alpine's.
 sh /aports/scripts/mkimage.sh --tag edge --arch x86_64 --profile catbed --hostkeys \
     --outdir /out --workdir /cache/mkimage --repository "$repo"
