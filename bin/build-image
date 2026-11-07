@@ -8,7 +8,7 @@
 #   cache/                exported closure, repo, mkimage work
 #   out/                  ISO, .sha256 and manifest
 #
-# usage: build-image check | iso | plan | shell
+# usage: build-image check | plan | iso | publish | shell
 set -eu
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -57,6 +57,38 @@ case ${1:-} in
         builder
         # shellcheck disable=SC2046
         container $(mounts) "$IMAGE" sh /src/builder/build-iso.sh
+        ;;
+    publish)
+        # Encrypt the built ISO to the recovery identity (the same SSH key
+        # RECOVERY.md decrypts with), split it under GitHub's 2 GiB asset
+        # limit and attach it to a release in the PRIVATE artifact repo.
+        target=${CATBED_PRIVATE_REPO:-Spaceghost/catbed-image-private}
+        [ "$(gh repo view "$target" --json visibility -q .visibility)" = PRIVATE ] ||
+            die "$target is not private; refusing to publish"
+        recipient=$PRIVATE/keys/recipient-catbed-jack.pub
+        [ -r "$recipient" ] || die "no recipient key at $recipient"
+        iso=$PRIVATE/out/alpine-catbed-edge-x86_64.iso
+        [ -r "$iso" ] || die "no ISO; run: build-image iso"
+        sum=$(cut -c1-8 "$iso.sha256")
+        tag=catbed-iso-$(date -u +%Y%m%d)-$sum
+        stage=$PRIVATE/publish/$tag
+        rm -rf "$stage"; mkdir -p "$stage"
+        builder
+        # shellcheck disable=SC2016 # expanded inside the container
+        container -v "$PRIVATE:/p:z" "$IMAGE" sh -euc '
+            apk add -q --no-cache age >/dev/null
+            cd "/p/publish/$1"
+            age -R /p/keys/recipient-catbed-jack.pub -o iso.age /p/out/alpine-catbed-edge-x86_64.iso
+            split -b 1900m -a 2 iso.age alpine-catbed-edge-x86_64.iso.age.part-
+            rm iso.age
+            cp /p/out/alpine-catbed-edge-x86_64.iso.sha256 /p/out/alpine-catbed-edge-x86_64.manifest.json .
+            sha256sum alpine-catbed-edge-x86_64.iso.age.part-* > SHA256SUMS
+        ' sh "$tag"
+        gh release create "$tag" --repo "$target" \
+            --title "catbed installer $tag" \
+            --notes "Age-encrypted to the catbed recovery identity. Reassemble: cat *.part-* > iso.age; age -d -i ~/.ssh/id_ed25519 -o alpine-catbed-edge-x86_64.iso iso.age; sha256sum -c alpine-catbed-edge-x86_64.iso.sha256" \
+            "$stage"/*
+        printf 'published %s to %s\n' "$tag" "$target"
         ;;
     shell)
         builder
