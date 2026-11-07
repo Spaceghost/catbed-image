@@ -41,6 +41,7 @@ findmnt
 lsblk
 lvm2
 sfdisk
+umount
 util-linux-misc
 EOF
 
